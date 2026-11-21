@@ -41,6 +41,7 @@ from stat_vision.real_evaluator import (
     evaluate_real_test_folder,
     get_cached_real_evaluation,
     resolve_real_test_dir,
+    start_real_evaluation_async,
 )
 
 
@@ -920,9 +921,16 @@ if let img = NSImage(pasteboard: pb),
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/real-accuracy/run":
-            eval_data = evaluate_real_test_folder(analyzer=self.analyzer, force=True)
-            payload = json.dumps(eval_data, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
+            try:
+                content_len = int(self.headers.get("Content-Length", 0) or 0)
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                eval_data = start_real_evaluation_async(analyzer=self.analyzer, force=True)
+                payload = json.dumps(eval_data, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+            except Exception as exc:
+                payload = json.dumps({"error": str(exc), "running": False}, ensure_ascii=False).encode("utf-8")
+                self.send_response(500)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
@@ -2454,15 +2462,44 @@ function closeRealAccuracyModal() {{
 async function runRealAccuracyEval() {{
   const btn = document.getElementById('runRealEvalBtn');
   const body = document.getElementById('realAccuracyModalBody');
-  if (btn) {{ btn.disabled = true; btn.textContent = '⏳ Avaliando imagens em modo cego...'; }}
-  if (body) body.innerHTML = '<div style="padding:24px;text-align:center;color:#bae6fd;">🧪 Executando avaliação cega nas imagens de <code>real_test_data/</code>... Aguarde alguns segundos.</div>';
+  if (btn) {{ btn.disabled = true; btn.textContent = '⏳ Avaliando em modo cego...'; }}
+  if (body) body.innerHTML = '<div style="padding:24px;text-align:center;color:#bae6fd;">🧪 Iniciando avaliação cega em <code>real_test_data/</code>...</div>';
   try {{
     const resp = await fetch('/api/real-accuracy/run', {{ method: 'POST' }});
-    const data = await resp.json();
-    updateRealAccuracyPillUI(data);
-    renderRealAccuracyModalBody(data);
+    const initData = await resp.json();
+    if (!resp.ok || initData.error) {{
+      throw new Error(initData.error || ('HTTP ' + resp.status));
+    }}
+    updateRealAccuracyPillUI(initData);
+
+    // Acompanha o progresso em tempo real sem risco de timeout HTTP no Windows
+    let attempts = 0;
+    while (attempts < 180) {{
+      attempts += 1;
+      await new Promise(r => setTimeout(r, 750));
+      const stResp = await fetch('/api/real-accuracy', {{ cache: 'no-store' }});
+      const stData = await stResp.json();
+      updateRealAccuracyPillUI(stData);
+      if (stData.running) {{
+        const pCur = stData.progress || 0;
+        const pTot = stData.progress_total || stData.image_count_in_folder || 0;
+        if (body) {{
+          body.innerHTML =
+            '<div style="padding:24px;text-align:center;color:#bae6fd;">' +
+            '🧪 Avaliando imagem <strong>' + pCur + '</strong> de <strong>' + pTot + '</strong> em modo cego... Aguarde.' +
+            '</div>';
+        }}
+      }} else {{
+        if (stData.last_error) {{
+          if (body) body.innerHTML = '<div style="color:#fda4af;">Erro na avaliação: ' + escapeHtmlBasic(stData.last_error) + '</div>';
+        }} else {{
+          renderRealAccuracyModalBody(stData);
+        }}
+        break;
+      }}
+    }}
   }} catch (e) {{
-    if (body) body.innerHTML = '<div style="color:#fda4af;">Erro ao executar a avaliação cega.</div>';
+    if (body) body.innerHTML = '<div style="color:#fda4af;">Erro ao executar a avaliação cega: ' + escapeHtmlBasic(e && e.message ? e.message : e) + '</div>';
   }} finally {{
     if (btn) {{ btn.disabled = false; btn.textContent = '🔄 Reavaliar Pasta Agora'; }}
   }}

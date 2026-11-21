@@ -49,6 +49,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from typing import Dict, List, Optional, Tuple, Callable, Any
@@ -6059,6 +6060,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
@@ -6189,15 +6191,27 @@ def _compute_folder_signature(image_paths: List[str]) -> List[List[Any]]:
     return sig
 
 
+_REAL_EVAL_LOCK = threading.Lock()
+_REAL_EVAL_STATUS: Dict[str, Any] = {
+    "running": False,
+    "progress": 0,
+    "total": 0,
+    "last_error": "",
+}
+
+
 def get_cached_real_evaluation(test_dir: Optional[str] = None) -> Dict[str, Any]:
     """
     Retorna rapidamente o resultado salvo em `evaluation_results.json` sem bloquear
-    a abertura do aplicativo, indicando se o cache está atualizado (`is_fresh`).
+    a abertura do aplicativo, indicando se o cache está atualizado (`is_fresh`) e
+    se há uma avaliação em andamento (`running`, `progress`, `total`).
     """
     tdir = test_dir or resolve_real_test_dir()
     images = _list_real_test_images(tdir)
     current_sig = _compute_folder_signature(images)
     cache_path = os.path.join(tdir, "evaluation_results.json")
+
+    status_snapshot = dict(_REAL_EVAL_STATUS)
 
     if os.path.isfile(cache_path):
         try:
@@ -6207,6 +6221,10 @@ def get_cached_real_evaluation(test_dir: Optional[str] = None) -> Dict[str, Any]
                 data["test_dir"] = tdir
                 data["image_count_in_folder"] = len(images)
                 data["is_fresh"] = (data.get("folder_signature") == current_sig)
+                data["running"] = bool(status_snapshot.get("running", False))
+                data["progress"] = int(status_snapshot.get("progress", 0))
+                data["progress_total"] = int(status_snapshot.get("total", len(images)))
+                data["last_error"] = str(status_snapshot.get("last_error", ""))
                 return data
         except Exception:
             pass
@@ -6219,10 +6237,45 @@ def get_cached_real_evaluation(test_dir: Optional[str] = None) -> Dict[str, Any]
         "unlabeled": 0,
         "accuracy_pct": None,
         "is_fresh": (len(images) == 0),
+        "running": bool(status_snapshot.get("running", False)),
+        "progress": int(status_snapshot.get("progress", 0)),
+        "progress_total": int(status_snapshot.get("total", len(images))),
+        "last_error": str(status_snapshot.get("last_error", "")),
         "items": [],
         "evaluated_at": None,
         "folder_signature": [],
     }
+
+
+def start_real_evaluation_async(
+    analyzer: Optional[StatisticalImageAnalyzer] = None,
+    test_dir: Optional[str] = None,
+    force: bool = True,
+) -> Dict[str, Any]:
+    """
+    Dispara a avaliação cega em segundo plano (sem travar nem dar timeout no HTTP),
+    evitando execuções simultâneas que causam WinError 32 no Windows.
+    """
+    tdir = test_dir or resolve_real_test_dir()
+    images = _list_real_test_images(tdir)
+
+    if not _REAL_EVAL_STATUS.get("running", False):
+        _REAL_EVAL_STATUS["running"] = True
+        _REAL_EVAL_STATUS["progress"] = 0
+        _REAL_EVAL_STATUS["total"] = len(images)
+        _REAL_EVAL_STATUS["last_error"] = ""
+
+        def _worker() -> None:
+            try:
+                evaluate_real_test_folder(analyzer=analyzer, test_dir=tdir, force=force)
+            except Exception as exc:
+                _REAL_EVAL_STATUS["last_error"] = str(exc)
+            finally:
+                _REAL_EVAL_STATUS["running"] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    return get_cached_real_evaluation(tdir)
 
 
 REQUIRED_PARAM_KEYS_BY_DIST: Dict[str, Tuple[str, ...]] = {
@@ -6412,155 +6465,179 @@ def evaluate_real_test_folder(
     unlabeled = 0
     sample_scores: List[float] = []
 
-    for idx, img_path in enumerate(images, start=1):
-        fname = os.path.basename(img_path)
-        gab_entry = gabarito.get(fname, {}) if isinstance(gabarito.get(fname), dict) else {}
-        fn_dist_key, fn_expected_params = parse_expected_from_filename(fname)
-        expected_key = gab_entry.get("dist") or fn_dist_key
-        expected_params = (
-            gab_entry.get("params")
-            if isinstance(gab_entry.get("params"), dict)
-            else fn_expected_params
-        )
-        ext = os.path.splitext(fname)[1].lower() or ".png"
-
-        # Copia os bytes brutos para um arquivo temporário completamente neutro
-        # para garantir que a IA NÃO possa usar o nome do arquivo ou da pasta.
-        tmp_blind_path = ""
-        t0 = time.perf_counter()
-        extracted_params: Dict[str, Any] = {}
+    with _REAL_EVAL_LOCK:
+        _REAL_EVAL_STATUS["running"] = True
+        _REAL_EVAL_STATUS["total"] = len(images)
+        _REAL_EVAL_STATUS["progress"] = 0
+        _REAL_EVAL_STATUS["last_error"] = ""
         try:
-            with open(img_path, "rb") as src_f:
-                raw_bytes = src_f.read()
-            tmp_f = tempfile.NamedTemporaryFile(
-                prefix=f"blind_eval_{idx:02d}_",
-                suffix=ext,
-                delete=False,
-            )
-            tmp_f.write(raw_bytes)
-            tmp_f.close()
-            tmp_blind_path = tmp_f.name
+            for idx, img_path in enumerate(images, start=1):
+                _REAL_EVAL_STATUS["progress"] = idx
+                fname = os.path.basename(img_path)
+                gab_entry = gabarito.get(fname, {}) if isinstance(gabarito.get(fname), dict) else {}
+                fn_dist_key, fn_expected_params = parse_expected_from_filename(fname)
+                expected_key = gab_entry.get("dist") or fn_dist_key
+                expected_params = (
+                    gab_entry.get("params")
+                    if isinstance(gab_entry.get("params"), dict)
+                    else fn_expected_params
+                )
+                ext = os.path.splitext(fname)[1].lower() or ".png"
 
-            report = analyzer.analyze(tmp_blind_path, extra_text_hint="")
-            elapsed_ms = int(round((time.perf_counter() - t0) * 1000))
-
-            predicted_key = report.identified_distribution.id if report.identified_distribution else "desconhecida"
-            predicted_name = report.identified_distribution.name if report.identified_distribution else "Não identificada"
-            ocr_text = (report.ocr_result.raw_text or "").strip() if report.ocr_result else ""
-            backend = report.ocr_result.backend_used if report.ocr_result else ""
-            confidence = round(float(report.confidence) * 100.0, 1)
-            stat_ctx = report.ocr_result.statistical_context if report.ocr_result else None
-            rv = stat_ctx.primary_random_variable if stat_ctx else ""
-            params = stat_ctx.image_parameters_latex if stat_ctx else ""
-            extracted_params = dict(stat_ctx.extracted_parameters) if (stat_ctx and stat_ctx.extracted_parameters) else {}
-        except Exception as exc:
-            elapsed_ms = int(round((time.perf_counter() - t0) * 1000))
-            predicted_key = "erro"
-            predicted_name = f"Erro: {exc}"
-            ocr_text = ""
-            backend = ""
-            confidence = 0.0
-            rv = ""
-            params = ""
-            extracted_params = {}
-        finally:
-            if tmp_blind_path and os.path.exists(tmp_blind_path):
+                # Copia os bytes brutos para um arquivo temporário completamente neutro
+                # para garantir que a IA NÃO possa usar o nome do arquivo ou da pasta.
+                tmp_blind_path = ""
+                t0 = time.perf_counter()
+                extracted_params: Dict[str, Any] = {}
                 try:
-                    os.unlink(tmp_blind_path)
-                except OSError:
-                    pass
+                    with open(img_path, "rb") as src_f:
+                        raw_bytes = src_f.read()
+                    tmp_f = tempfile.NamedTemporaryFile(
+                        prefix=f"blind_eval_{idx:02d}_",
+                        suffix=ext,
+                        delete=False,
+                    )
+                    tmp_f.write(raw_bytes)
+                    tmp_f.close()
+                    tmp_blind_path = tmp_f.name
 
-        expected_name = (
-            DISTRIBUTIONS_DB[expected_key].name
-            if expected_key and expected_key in DISTRIBUTIONS_DB
-            else "Rótulo não reconhecido no nome do arquivo"
-        )
+                    report = analyzer.analyze(tmp_blind_path, extra_text_hint="")
+                    elapsed_ms = int(round((time.perf_counter() - t0) * 1000))
 
-        if expected_key is None:
-            unlabeled += 1
-            status = "sem_gabarito"
-            passed = None
-            dist_ok = None
-            params_ok = None
-            sample_score = None
-        else:
-            evaluated += 1
-            dist_ok = (predicted_key == expected_key)
-            params_ok = _check_parameters_match(expected_key, extracted_params, expected_params)
-            sample_score = compute_sample_accuracy_score(dist_ok, params_ok)
-            sample_scores.append(sample_score)
+                    predicted_key = report.identified_distribution.id if report.identified_distribution else "desconhecida"
+                    predicted_name = report.identified_distribution.name if report.identified_distribution else "Não identificada"
+                    ocr_text = (report.ocr_result.raw_text or "").strip() if report.ocr_result else ""
+                    backend = report.ocr_result.backend_used if report.ocr_result else ""
+                    confidence = round(float(report.confidence) * 100.0, 1)
+                    stat_ctx = report.ocr_result.statistical_context if report.ocr_result else None
+                    rv = stat_ctx.primary_random_variable if stat_ctx else ""
+                    params = stat_ctx.image_parameters_latex if stat_ctx else ""
+                    extracted_params = dict(stat_ctx.extracted_parameters) if (stat_ctx and stat_ctx.extracted_parameters) else {}
+                except Exception as exc:
+                    elapsed_ms = int(round((time.perf_counter() - t0) * 1000))
+                    predicted_key = "erro"
+                    predicted_name = f"Erro: {exc}"
+                    ocr_text = ""
+                    backend = ""
+                    confidence = 0.0
+                    rv = ""
+                    params = ""
+                    extracted_params = {}
+                finally:
+                    if tmp_blind_path and os.path.exists(tmp_blind_path):
+                        try:
+                            os.unlink(tmp_blind_path)
+                        except OSError:
+                            pass
 
-            if dist_ok:
-                dist_hits += 1
-            if params_ok:
-                param_hits += 1
+                expected_name = (
+                    DISTRIBUTIONS_DB[expected_key].name
+                    if expected_key and expected_key in DISTRIBUTIONS_DB
+                    else "Rótulo não reconhecido no nome do arquivo"
+                )
 
-            if sample_score >= 1.0:
-                full_hits += 1
-                status = "acertou"
-                passed = True
-            elif sample_score >= 0.5:
-                partial_hits += 1
-                status = "parcial"
-                passed = None
-            else:
-                misses += 1
-                status = "errou"
-                passed = False
+                if expected_key is None:
+                    unlabeled += 1
+                    status = "sem_gabarito"
+                    passed = None
+                    dist_ok = None
+                    params_ok = None
+                    sample_score = None
+                else:
+                    evaluated += 1
+                    dist_ok = (predicted_key == expected_key)
+                    params_ok = _check_parameters_match(expected_key, extracted_params, expected_params)
+                    sample_score = compute_sample_accuracy_score(dist_ok, params_ok)
+                    sample_scores.append(sample_score)
 
-        items.append(
-            {
-                "index": idx,
-                "filename": fname,
-                "expected_key": expected_key,
-                "expected_name": expected_name,
-                "expected_params": expected_params,
-                "predicted_key": predicted_key,
-                "predicted_name": predicted_name,
-                "dist_ok": dist_ok,
-                "params_ok": params_ok,
-                "sample_score": sample_score,
-                "passed": passed,
-                "status": status,
-                "confidence_pct": confidence,
-                "random_variable": rv,
-                "extracted_parameters": extracted_params,
-                "parameters_latex": params,
-                "ocr_text": ocr_text,
-                "backend": backend,
-                "elapsed_ms": elapsed_ms,
+                    if dist_ok:
+                        dist_hits += 1
+                    if params_ok:
+                        param_hits += 1
+
+                    if sample_score >= 1.0:
+                        full_hits += 1
+                        status = "acertou"
+                        passed = True
+                    elif sample_score >= 0.5:
+                        partial_hits += 1
+                        status = "parcial"
+                        passed = None
+                    else:
+                        misses += 1
+                        status = "errou"
+                        passed = False
+
+                items.append(
+                    {
+                        "index": idx,
+                        "filename": fname,
+                        "expected_key": expected_key,
+                        "expected_name": expected_name,
+                        "expected_params": expected_params,
+                        "predicted_key": predicted_key,
+                        "predicted_name": predicted_name,
+                        "dist_ok": dist_ok,
+                        "params_ok": params_ok,
+                        "sample_score": sample_score,
+                        "passed": passed,
+                        "status": status,
+                        "confidence_pct": confidence,
+                        "random_variable": rv,
+                        "extracted_parameters": extracted_params,
+                        "parameters_latex": params,
+                        "ocr_text": ocr_text,
+                        "backend": backend,
+                        "elapsed_ms": elapsed_ms,
+                    }
+                )
+
+            total_points = round(sum(sample_scores), 2) if sample_scores else 0.0
+            accuracy_pct = compute_global_accuracy(sample_scores)
+            result = {
+                "test_dir": tdir,
+                "image_count_in_folder": len(images),
+                "evaluated": evaluated,
+                "correct": full_hits,
+                "partial": partial_hits,
+                "wrong": misses,
+                "dist_hits": dist_hits,
+                "param_hits": param_hits,
+                "total_points": total_points,
+                "unlabeled": unlabeled,
+                "accuracy_pct": accuracy_pct,
+                "scoring_formula": "s_i = (d_i + p_i) / 2  |  1.0 = Dist+Params, 0.5 = Apenas um, 0.0 = Errou ambos",
+                "is_fresh": True,
+                "running": False,
+                "progress": len(images),
+                "progress_total": len(images),
+                "last_error": "",
+                "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "folder_signature": current_sig,
+                "items": items,
             }
-        )
 
-    total_points = round(sum(sample_scores), 2) if sample_scores else 0.0
-    accuracy_pct = compute_global_accuracy(sample_scores)
-    result = {
-        "test_dir": tdir,
-        "image_count_in_folder": len(images),
-        "evaluated": evaluated,
-        "correct": full_hits,
-        "partial": partial_hits,
-        "wrong": misses,
-        "dist_hits": dist_hits,
-        "param_hits": param_hits,
-        "total_points": total_points,
-        "unlabeled": unlabeled,
-        "accuracy_pct": accuracy_pct,
-        "scoring_formula": "s_i = (d_i + p_i) / 2  |  1.0 = Dist+Params, 0.5 = Apenas um, 0.0 = Errou ambos",
-        "is_fresh": True,
-        "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "folder_signature": current_sig,
-        "items": items,
-    }
+            cache_path = os.path.join(tdir, "evaluation_results.json")
+            tmp_cache_path = os.path.join(tdir, f".evaluation_results_{os.getpid()}.tmp")
+            try:
+                with open(tmp_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_cache_path, cache_path)
+            except Exception:
+                try:
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump(result, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                if os.path.exists(tmp_cache_path):
+                    try:
+                        os.unlink(tmp_cache_path)
+                    except OSError:
+                        pass
 
-    cache_path = os.path.join(tdir, "evaluation_results.json")
-    try:
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-    return result
+            return result
+        finally:
+            _REAL_EVAL_STATUS["running"] = False
 
 
 # ================================================================================================
@@ -7761,9 +7838,16 @@ if let img = NSImage(pasteboard: pb),
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/real-accuracy/run":
-            eval_data = evaluate_real_test_folder(analyzer=self.analyzer, force=True)
-            payload = json.dumps(eval_data, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
+            try:
+                content_len = int(self.headers.get("Content-Length", 0) or 0)
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                eval_data = start_real_evaluation_async(analyzer=self.analyzer, force=True)
+                payload = json.dumps(eval_data, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+            except Exception as exc:
+                payload = json.dumps({"error": str(exc), "running": False}, ensure_ascii=False).encode("utf-8")
+                self.send_response(500)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
@@ -9295,15 +9379,44 @@ function closeRealAccuracyModal() {{
 async function runRealAccuracyEval() {{
   const btn = document.getElementById('runRealEvalBtn');
   const body = document.getElementById('realAccuracyModalBody');
-  if (btn) {{ btn.disabled = true; btn.textContent = '⏳ Avaliando imagens em modo cego...'; }}
-  if (body) body.innerHTML = '<div style="padding:24px;text-align:center;color:#bae6fd;">🧪 Executando avaliação cega nas imagens de <code>real_test_data/</code>... Aguarde alguns segundos.</div>';
+  if (btn) {{ btn.disabled = true; btn.textContent = '⏳ Avaliando em modo cego...'; }}
+  if (body) body.innerHTML = '<div style="padding:24px;text-align:center;color:#bae6fd;">🧪 Iniciando avaliação cega em <code>real_test_data/</code>...</div>';
   try {{
     const resp = await fetch('/api/real-accuracy/run', {{ method: 'POST' }});
-    const data = await resp.json();
-    updateRealAccuracyPillUI(data);
-    renderRealAccuracyModalBody(data);
+    const initData = await resp.json();
+    if (!resp.ok || initData.error) {{
+      throw new Error(initData.error || ('HTTP ' + resp.status));
+    }}
+    updateRealAccuracyPillUI(initData);
+
+    // Acompanha o progresso em tempo real sem risco de timeout HTTP no Windows
+    let attempts = 0;
+    while (attempts < 180) {{
+      attempts += 1;
+      await new Promise(r => setTimeout(r, 750));
+      const stResp = await fetch('/api/real-accuracy', {{ cache: 'no-store' }});
+      const stData = await stResp.json();
+      updateRealAccuracyPillUI(stData);
+      if (stData.running) {{
+        const pCur = stData.progress || 0;
+        const pTot = stData.progress_total || stData.image_count_in_folder || 0;
+        if (body) {{
+          body.innerHTML =
+            '<div style="padding:24px;text-align:center;color:#bae6fd;">' +
+            '🧪 Avaliando imagem <strong>' + pCur + '</strong> de <strong>' + pTot + '</strong> em modo cego... Aguarde.' +
+            '</div>';
+        }}
+      }} else {{
+        if (stData.last_error) {{
+          if (body) body.innerHTML = '<div style="color:#fda4af;">Erro na avaliação: ' + escapeHtmlBasic(stData.last_error) + '</div>';
+        }} else {{
+          renderRealAccuracyModalBody(stData);
+        }}
+        break;
+      }}
+    }}
   }} catch (e) {{
-    if (body) body.innerHTML = '<div style="color:#fda4af;">Erro ao executar a avaliação cega.</div>';
+    if (body) body.innerHTML = '<div style="color:#fda4af;">Erro ao executar a avaliação cega: ' + escapeHtmlBasic(e && e.message ? e.message : e) + '</div>';
   }} finally {{
     if (btn) {{ btn.disabled = false; btn.textContent = '🔄 Reavaliar Pasta Agora'; }}
   }}
