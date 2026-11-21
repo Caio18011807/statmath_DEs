@@ -284,6 +284,7 @@ class OfflineOCREngine:
     def _run_windows_native_ocr(image_path: str) -> Optional[str]:
         abs_path = os.path.abspath(image_path).replace("'", "''")
         ps_script = (
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
             "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
             "$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]; "
             "$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]; "
@@ -299,12 +300,16 @@ class OfflineOCREngine:
             "$res = Await ($engine.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult]); "
             "foreach ($line in $res.Lines) { Write-Output $line.Text } }"
         )
+        win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         try:
             proc = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=15,
+                creationflags=win_flags,
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 return proc.stdout.strip()

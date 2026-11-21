@@ -843,12 +843,16 @@ if let img = NSImage(pasteboard: pb),
                 "$img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); "
                 "[Convert]::ToBase64String($ms.ToArray()) }"
             )
+            win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             try:
                 proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-STA", "-Command", ps_clip],
+                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-STA", "-Command", ps_clip],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
+                    creationflags=win_flags,
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     return proc.stdout.strip()
@@ -2490,10 +2494,31 @@ if ({real_eval_needs_poll_js}) {{
         self.wfile.write(encoded)
 
 
-def run_standalone_server(port: int = 8501) -> None:
+def run_standalone_server(port: int = 8501, open_browser: bool = False) -> None:
     import threading
+    import webbrowser
+
+    # Garante saída UTF-8 segura no console do Windows (evita UnicodeEncodeError com acentos/emojis)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     ThreadingHTTPServer.allow_reuse_address = True
-    server = ThreadingHTTPServer(("127.0.0.1", port), StatVisionHTTPHandler)
+    server = None
+    bound_port = port
+    last_err: Optional[Exception] = None
+    for candidate_port in range(port, port + 20):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", candidate_port), StatVisionHTTPHandler)
+            bound_port = candidate_port
+            break
+        except OSError as exc:
+            last_err = exc
+    if server is None:
+        raise RuntimeError(f"Nao foi possivel abrir o servidor local nas portas {port}-{port + 19}: {last_err}")
 
     def _background_warmup_and_eval() -> None:
         try:
@@ -2506,13 +2531,18 @@ def run_standalone_server(port: int = 8501) -> None:
 
     # Pré-aquece padrões treinados e atualiza a acurácia real em segundo plano sem atrasar a abertura
     threading.Thread(target=_background_warmup_and_eval, daemon=True).start()
-    print(f"=====================================================================")
-    print(f" StatMath rodando em: http://127.0.0.1:{port}")
-    print(f" Pressione Ctrl+C para encerrar.")
-    print(f"=====================================================================")
+    url = f"http://127.0.0.1:{bound_port}"
+    if open_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    print("=====================================================================")
+    print(f" StatMath rodando em: {url}")
+    print(" Mantenha esta janela aberta enquanto usa o aplicativo.")
+    print(" Pressione Ctrl+C para encerrar.")
+    print("=====================================================================")
     server.serve_forever()
 
 
 if __name__ == "__main__":
     port_arg = int(sys.argv[1]) if len(sys.argv[1:]) >= 1 and sys.argv[1].isdigit() else 8501
-    run_standalone_server(port=port_arg)
+    run_standalone_server(port=port_arg, open_browser=True)

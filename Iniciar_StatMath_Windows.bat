@@ -1,33 +1,93 @@
 @echo off
-chcp 65001 >nul
-REM Clicar duas vezes neste arquivo no Windows inicia o StatMath automaticamente sem precisar digitar comandos!
-REM Encontra automaticamente a propria pasta em qualquer computador Windows.
+setlocal EnableExtensions
+title StatMath - Leitor de Distribuicoes Estatisticas
+chcp 65001 >nul 2>nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+
 cd /d "%~dp0"
 
-where py >nul 2>nul
-if %errorlevel%==0 (
-    py -3 stat_vision_completo_ai_studio.py --port 8501
-    goto :fim
-)
-
-where python >nul 2>nul
-if %errorlevel%==0 (
-    python stat_vision_completo_ai_studio.py --port 8501
-    goto :fim
-)
-
-where python3 >nul 2>nul
-if %errorlevel%==0 (
-    python3 stat_vision_completo_ai_studio.py --port 8501
-    goto :fim
-)
-
-echo.
 echo ============================================================================
-echo  Python 3 nao foi encontrado neste computador Windows.
-echo  Instale em: https://www.python.org/downloads/
-echo  (Marque a opcao "Add Python to PATH" durante a instalacao)
+echo  STATMATH - Iniciando aplicativo local...
+echo  Pasta: %CD%
+echo ============================================================================
+echo.
+
+set "ENTRY_SCRIPT=stat_vision_completo_ai_studio.py"
+if not exist "%ENTRY_SCRIPT%" set "ENTRY_SCRIPT=app.py"
+if not exist "%ENTRY_SCRIPT%" (
+    echo [ERRO] Arquivo principal do StatMath nao encontrado nesta pasta!
+    echo Extraia todo o conteudo do ZIP antes de executar este arquivo.
+    echo.
+    pause
+    exit /b 1
+)
+
+set "PY_CMD="
+
+REM 1. Testa py -3 (Windows Python Launcher)
+py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)" >nul 2>nul
+if not errorlevel 1 (
+    set "PY_CMD=py -3"
+    goto :run_app
+)
+
+REM 2. Testa python no PATH (ignora o atalho falso da Microsoft Store!)
+python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)" >nul 2>nul
+if not errorlevel 1 (
+    set "PY_CMD=python"
+    goto :run_app
+)
+
+REM 3. Testa python3 no PATH
+python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)" >nul 2>nul
+if not errorlevel 1 (
+    set "PY_CMD=python3"
+    goto :run_app
+)
+
+REM 4. Procura instalacoes padrao do Python 3 fora do PATH
+for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "C:\Python3*" "%ProgramFiles%\Python3*") do (
+    if exist "%%~D\python.exe" (
+        "%%~D\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)" >nul 2>nul
+        if not errorlevel 1 (
+            set "PY_CMD="%%~D\python.exe""
+            goto :run_app
+        )
+    )
+)
+
+echo ============================================================================
+echo  [AVISO] Python 3 nao foi encontrado neste computador Windows!
+echo.
+echo  Como resolver em 1 minuto:
+echo   1. Acesse: https://www.python.org/downloads/
+echo   2. Baixe e abra o instalador do Python 3.
+echo   3. IMPORTANTE: marque a caixinha "Add python.exe to PATH" antes de instalar.
+echo   4. Depois de instalar, clique duas vezes neste arquivo novamente!
 echo ============================================================================
 echo.
 pause
-:fim
+exit /b 1
+
+:run_app
+echo Python 3 detectado (%PY_CMD%). Abrindo StatMath no navegador...
+echo (Mantenha esta janela aberta enquanto estiver usando o aplicativo.)
+echo.
+if /i "%ENTRY_SCRIPT%"=="app.py" (
+    %PY_CMD% "%ENTRY_SCRIPT%" 8501
+) else (
+    %PY_CMD% "%ENTRY_SCRIPT%" --port 8501
+)
+set "EXIT_CODE=%ERRORLEVEL%"
+
+echo.
+if not "%EXIT_CODE%"=="0" (
+    echo ============================================================================
+    echo  [ERRO] O StatMath encerrou inesperadamente (codigo %EXIT_CODE%).
+    echo  Tire um print desta tela se precisar de ajuda para diagnostico.
+    echo ============================================================================
+    echo.
+    pause
+)
+endlocal

@@ -2500,6 +2500,7 @@ class OfflineOCREngine:
     def _run_windows_native_ocr(image_path: str) -> Optional[str]:
         abs_path = os.path.abspath(image_path).replace("'", "''")
         ps_script = (
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
             "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
             "$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]; "
             "$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]; "
@@ -2515,12 +2516,16 @@ class OfflineOCREngine:
             "$res = Await ($engine.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult]); "
             "foreach ($line in $res.Lines) { Write-Output $line.Text } }"
         )
+        win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         try:
             proc = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=15,
+                creationflags=win_flags,
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 return proc.stdout.strip()
@@ -4787,7 +4792,13 @@ class PurePythonPNGReader:
             return PurePythonPNGReader._decode_png(data)
 
         # 4. Cross-platform JPEG / HEIC / WEBP / BMP / TIFF -> PNG converters (macOS sips, Windows PowerShell, ImageMagick, ffmpeg)
-        tmp_png = os.path.join(tempfile.gettempdir(), f"statmath_conv_{os.getpid()}.png")
+        import threading
+        import time
+        tmp_png = os.path.join(
+            tempfile.gettempdir(),
+            f"statmath_conv_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.png",
+        )
+        win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         try:
             converted = False
             # 4a. macOS built-in `sips`
@@ -4811,9 +4822,10 @@ class PurePythonPNGReader:
                     "$img.Dispose()"
                 )
                 proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
                     capture_output=True,
                     timeout=12,
+                    creationflags=win_flags,
                 )
                 converted = proc.returncode == 0 and os.path.exists(tmp_png)
 
@@ -7601,12 +7613,16 @@ if let img = NSImage(pasteboard: pb),
                 "$img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); "
                 "[Convert]::ToBase64String($ms.ToArray()) }"
             )
+            win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             try:
                 proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-STA", "-Command", ps_clip],
+                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-STA", "-Command", ps_clip],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
+                    creationflags=win_flags,
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     return proc.stdout.strip()
@@ -9248,10 +9264,31 @@ if ({real_eval_needs_poll_js}) {{
         self.wfile.write(encoded)
 
 
-def run_standalone_server(port: int = 8501) -> None:
+def run_standalone_server(port: int = 8501, open_browser: bool = False) -> None:
     import threading
+    import webbrowser
+
+    # Garante saída UTF-8 segura no console do Windows (evita UnicodeEncodeError com acentos/emojis)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     ThreadingHTTPServer.allow_reuse_address = True
-    server = ThreadingHTTPServer(("127.0.0.1", port), StatVisionHTTPHandler)
+    server = None
+    bound_port = port
+    last_err: Optional[Exception] = None
+    for candidate_port in range(port, port + 20):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", candidate_port), StatVisionHTTPHandler)
+            bound_port = candidate_port
+            break
+        except OSError as exc:
+            last_err = exc
+    if server is None:
+        raise RuntimeError(f"Nao foi possivel abrir o servidor local nas portas {port}-{port + 19}: {last_err}")
 
     def _background_warmup_and_eval() -> None:
         try:
@@ -9264,10 +9301,15 @@ def run_standalone_server(port: int = 8501) -> None:
 
     # Pré-aquece padrões treinados e atualiza a acurácia real em segundo plano sem atrasar a abertura
     threading.Thread(target=_background_warmup_and_eval, daemon=True).start()
-    print(f"=====================================================================")
-    print(f" StatMath rodando em: http://127.0.0.1:{port}")
-    print(f" Pressione Ctrl+C para encerrar.")
-    print(f"=====================================================================")
+    url = f"http://127.0.0.1:{bound_port}"
+    if open_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    print("=====================================================================")
+    print(f" StatMath rodando em: {url}")
+    print(" Mantenha esta janela aberta enquanto usa o aplicativo.")
+    print(" Pressione Ctrl+C para encerrar.")
+    print("=====================================================================")
     server.serve_forever()
 
 
@@ -9278,8 +9320,13 @@ def run_standalone_server(port: int = 8501) -> None:
 # ================================================================================================
 
 def main_unified() -> int:
-    import webbrowser
-    import threading
+    # Garante saida UTF-8 segura no console do Windows (evita crash UnicodeEncodeError com emojis)
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(_stream, "reconfigure"):
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     parser = argparse.ArgumentParser(
         description="StatMath (StatVision OCR) — Aplicativo Aberto e Portátil para Distribuições Estatísticas"
@@ -9320,11 +9367,7 @@ def main_unified() -> int:
             print(analyzer.format_markdown_report(report))
         return 0
 
-    if not args.no_browser:
-        url = f"http://127.0.0.1:{args.port}"
-        threading.Timer(0.9, lambda: webbrowser.open(url)).start()
-
-    run_standalone_server(port=args.port)
+    run_standalone_server(port=args.port, open_browser=(not args.no_browser))
     return 0
 
 

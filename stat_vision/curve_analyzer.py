@@ -106,7 +106,13 @@ class PurePythonPNGReader:
             return PurePythonPNGReader._decode_png(data)
 
         # 4. Cross-platform JPEG / HEIC / WEBP / BMP / TIFF -> PNG converters (macOS sips, Windows PowerShell, ImageMagick, ffmpeg)
-        tmp_png = os.path.join(tempfile.gettempdir(), f"statmath_conv_{os.getpid()}.png")
+        import threading
+        import time
+        tmp_png = os.path.join(
+            tempfile.gettempdir(),
+            f"statmath_conv_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.png",
+        )
+        win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         try:
             converted = False
             # 4a. macOS built-in `sips`
@@ -130,9 +136,10 @@ class PurePythonPNGReader:
                     "$img.Dispose()"
                 )
                 proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
                     capture_output=True,
                     timeout=12,
+                    creationflags=win_flags,
                 )
                 converted = proc.returncode == 0 and os.path.exists(tmp_png)
 
