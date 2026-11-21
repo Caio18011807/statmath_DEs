@@ -29,21 +29,21 @@ REM 1. Testa py -3 (Windows Python Launcher)
 py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)" >nul 2>nul
 if not errorlevel 1 (
     set "PY_CMD=py -3"
-    goto :run_app
+    goto :check_ocr
 )
 
 REM 2. Testa python no PATH (ignora o atalho falso da Microsoft Store!)
 python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)" >nul 2>nul
 if not errorlevel 1 (
     set "PY_CMD=python"
-    goto :run_app
+    goto :check_ocr
 )
 
 REM 3. Testa python3 no PATH
 python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)" >nul 2>nul
 if not errorlevel 1 (
     set "PY_CMD=python3"
-    goto :run_app
+    goto :check_ocr
 )
 
 REM 4. Procura instalacoes padrao do Python 3 fora do PATH
@@ -52,7 +52,7 @@ for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "C:\Python3*" "%Program
         "%%~D\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)" >nul 2>nul
         if not errorlevel 1 (
             set "PY_CMD="%%~D\python.exe""
-            goto :run_app
+            goto :check_ocr
         )
     )
 )
@@ -70,8 +70,22 @@ echo.
 pause
 exit /b 1
 
+:check_ocr
+echo Python 3 detectado (%PY_CMD%).
+REM Garante o motor de OCR neural multiplataforma (RapidOCR ONNX, leve, apenas 1a vez)
+%PY_CMD% -c "import rapidocr_onnxruntime" >nul 2>nul
+if errorlevel 1 (
+    echo Preparando motor de OCR neural multiplataforma ^(apenas na 1a execucao^)...
+    %PY_CMD% -m pip install --quiet --disable-pip-version-check rapidocr-onnxruntime >nul 2>nul
+    if errorlevel 1 (
+        echo [INFO] Seguindo com o OCR nativo do Windows ^(sem internet ou pip indisponivel^).
+    ) else (
+        echo [OK] Motor de OCR neural instalado com sucesso!
+    )
+)
+
 :run_app
-echo Python 3 detectado (%PY_CMD%). Abrindo StatMath no navegador...
+echo Abrindo StatMath no navegador...
 echo (Mantenha esta janela aberta enquanto estiver usando o aplicativo.)
 echo.
 if /i "%ENTRY_SCRIPT%"=="app.py" (

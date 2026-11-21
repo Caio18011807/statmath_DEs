@@ -13,6 +13,7 @@ Especializado em:
    - Como a expressão DEVERIA ser escrita formalmente (notação tipográfica LaTeX canônica + dicas didáticas de correção da escrita manuscrita).
 """
 
+import base64
 import difflib
 import hashlib
 import json
@@ -216,44 +217,57 @@ class OfflineOCREngine:
         "uniform/Uniform_dist9.jpeg": "X ~ U(0, 1) => f(x) = I_{[0,1]}(x)",
     }
 
+    _rapidocr_engine: Any = None
+    _rapidocr_checked: bool = False
+    _easyocr_reader: Any = None
+    _easyocr_checked: bool = False
+
+    @classmethod
+    def _run_rapidocr(cls, image_path: str) -> Optional[str]:
+        """Executa RapidOCR (PP-OCRv4 ONNX multiplataforma, leve e rápido em CPU) se instalado."""
+        if not cls._rapidocr_checked:
+            cls._rapidocr_checked = True
+            try:
+                from rapidocr_onnxruntime import RapidOCR  # type: ignore
+                cls._rapidocr_engine = RapidOCR()
+            except Exception:
+                cls._rapidocr_engine = None
+        if cls._rapidocr_engine is None:
+            return None
+        try:
+            result, _ = cls._rapidocr_engine(image_path)
+            if not result:
+                return None
+            # Ordena caixas de texto de cima para baixo e da esquerda para a direita
+            lines = [str(item[1]).strip() for item in result if len(item) >= 2 and str(item[1]).strip()]
+            return "\n".join(lines) if lines else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _run_easyocr(cls, image_path: str) -> Optional[str]:
+        if not cls._easyocr_checked:
+            cls._easyocr_checked = True
+            try:
+                import easyocr  # type: ignore
+                cls._easyocr_reader = easyocr.Reader(["pt", "en"], gpu=False, verbose=False)
+            except Exception:
+                cls._easyocr_reader = None
+        if cls._easyocr_reader is None:
+            return None
+        try:
+            results = cls._easyocr_reader.readtext(image_path, detail=0)
+            return "\n".join(results) if results else None
+        except Exception:
+            return None
+
     def extract_text(self, image_path: str) -> Tuple[str, str]:
         if not os.path.exists(image_path):
             return "", "arquivo_nao_encontrado"
 
         sidecar_text = self._read_png_text_chunks(image_path)
 
-        # 1. Tenta EasyOCR se instalado
-        try:
-            import easyocr  # type: ignore
-            reader = easyocr.Reader(["pt", "en"], gpu=False, verbose=False)
-            results = reader.readtext(image_path, detail=0)
-            if results:
-                combined = "\n".join(results)
-                if sidecar_text and sidecar_text not in combined:
-                    combined = combined + "\n" + sidecar_text
-                return combined, "EasyOCR (Rede Neural Local para Manuscritos)"
-        except Exception:
-            pass
-
-        # 2. Tenta Tesseract CLI se instalado
-        tesseract_bin = shutil.which("tesseract")
-        if tesseract_bin:
-            try:
-                proc = subprocess.run(
-                    [tesseract_bin, image_path, "stdout", "--psm", "6"],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    combined = proc.stdout.strip()
-                    if sidecar_text and sidecar_text not in combined:
-                        combined = combined + "\n" + sidecar_text
-                    return combined, "Tesseract OCR (Motor Local CLI)"
-            except Exception:
-                pass
-
-        # 3. Tenta Apple Vision Framework nativo do macOS (excelente para escrita à mão!)
+        # 1. No macOS, prioriza o Apple Vision Framework nativo (excelente para escrita cursiva manuscrita)
         if sys.platform == "darwin" and shutil.which("swift"):
             try:
                 text = self._run_macos_vision_ocr(image_path)
@@ -264,7 +278,21 @@ class OfflineOCREngine:
             except Exception:
                 pass
 
-        # 4. Tenta Windows.Media.Ocr nativo do Windows 10/11 via PowerShell (sem dependências externas)
+        # 2. Tenta RapidOCR (ONNX multiplataforma — mesmo desempenho em Windows, Linux e macOS!)
+        rapid_txt = self._run_rapidocr(image_path)
+        if rapid_txt:
+            if sidecar_text and sidecar_text not in rapid_txt:
+                rapid_txt = rapid_txt + "\n" + sidecar_text
+            return rapid_txt, "RapidOCR (Rede Neural ONNX Multiplataforma)"
+
+        # 3. Tenta EasyOCR se instalado (instância em cache)
+        easy_txt = self._run_easyocr(image_path)
+        if easy_txt:
+            if sidecar_text and sidecar_text not in easy_txt:
+                easy_txt = easy_txt + "\n" + sidecar_text
+            return easy_txt, "EasyOCR (Rede Neural Local para Manuscritos)"
+
+        # 4. Tenta Windows.Media.Ocr nativo do Windows 10/11 via PowerShell (zero dependências externas)
         if sys.platform == "win32" and shutil.which("powershell"):
             try:
                 text = self._run_windows_native_ocr(image_path)
@@ -272,6 +300,28 @@ class OfflineOCREngine:
                     if sidecar_text and sidecar_text not in text:
                         text = text + "\n" + sidecar_text
                     return text, "Windows Native OCR (WinRT PowerShell)"
+            except Exception:
+                pass
+
+        # 5. Tenta Tesseract CLI se instalado
+        tesseract_bin = shutil.which("tesseract")
+        if tesseract_bin:
+            try:
+                win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+                proc = subprocess.run(
+                    [tesseract_bin, image_path, "stdout", "--psm", "6"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15,
+                    creationflags=win_flags,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    combined = proc.stdout.strip()
+                    if sidecar_text and sidecar_text not in combined:
+                        combined = combined + "\n" + sidecar_text
+                    return combined, "Tesseract OCR (Motor Local CLI)"
             except Exception:
                 pass
 
@@ -284,31 +334,52 @@ class OfflineOCREngine:
     def _run_windows_native_ocr(image_path: str) -> Optional[str]:
         abs_path = os.path.abspath(image_path).replace("'", "''")
         ps_script = (
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-            "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
-            "$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]; "
-            "$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]; "
-            "$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime]; "
-            "$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
-            "function Await($op, $t) { $m = $asTask.MakeGenericMethod($t); $task = $m.Invoke($null, @($op)); $task.Wait(); return $task.Result }; "
-            f"$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{abs_path}')) ([Windows.Storage.StorageFile]); "
-            "$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream]); "
-            "$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder]); "
-            "$bmp = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]); "
-            "$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages(); "
-            "if ($null -ne $engine) { "
-            "$res = Await ($engine.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult]); "
-            "foreach ($line in $res.Lines) { Write-Output $line.Text } }"
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+            "Add-Type -AssemblyName System.Runtime.WindowsRuntime\n"
+            "$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]\n"
+            "$null = [Windows.Storage.FileAccessMode, Windows.Storage, ContentType=WindowsRuntime]\n"
+            "$null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]\n"
+            "$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]\n"
+            "$null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType=WindowsRuntime]\n"
+            "$null = [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType=WindowsRuntime]\n"
+            "$null = [Windows.Media.Ocr.OcrResult, Windows.Media.Ocr, ContentType=WindowsRuntime]\n"
+            "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { "
+            "$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' "
+            "})[0]\n"
+            "function Await($WinRtTask, $ResultType) {\n"
+            "  $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)\n"
+            "  $netTask = $asTask.Invoke($null, @($WinRtTask))\n"
+            "  $netTask.Wait(-1) | Out-Null\n"
+            "  $netTask.Result\n"
+            "}\n"
+            f"$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{abs_path}')) ([Windows.Storage.StorageFile])\n"
+            "$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])\n"
+            "try {\n"
+            "  $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])\n"
+            "  $bmp = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])\n"
+            "  $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()\n"
+            "  if ($null -eq $engine) {\n"
+            "    $langs = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages\n"
+            "    if ($langs.Count -gt 0) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($langs[0]) }\n"
+            "  }\n"
+            "  if ($null -ne $engine) {\n"
+            "    $res = Await ($engine.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult])\n"
+            "    foreach ($line in $res.Lines) { Write-Output $line.Text }\n"
+            "  }\n"
+            "} finally {\n"
+            "  if ($null -ne $stream) { $stream.Dispose() }\n"
+            "}\n"
         )
+        encoded_ps = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
         win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         try:
             proc = subprocess.run(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", encoded_ps],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=15,
+                timeout=20,
                 creationflags=win_flags,
             )
             if proc.returncode == 0 and proc.stdout.strip():

@@ -1,8 +1,10 @@
-# Dependências opcionais para OCR neural (EasyOCR), Tesseract, OpenCV e interface Streamlit.
-# Observação: O aplicativo também funciona perfeitamente SEM instalar nenhuma dependência externa,
-# usando o OCR nativo do sistema (macOS Apple Vision / Windows WinRT OCR), leitor PNG em Python puro
-# e servidor web local integrado com KaTeX!
+# Motor de OCR neural leve e multiplataforma (ONNX em CPU — mesmo desempenho no Windows, Linux e macOS).
+# Instalado automaticamente na 1a execucao pelos inicializadores do Windows e Linux.
+rapidocr-onnxruntime>=1.3.24
 
+# Dependências opcionais adicionais (EasyOCR, Tesseract, OpenCV, Streamlit):
+# Observação: No macOS o aplicativo já usa o Apple Vision Framework nativo;
+# no Windows 10/11 também conta com fallback para o Windows WinRT OCR nativo.
 streamlit>=1.32.0
 easyocr>=1.7.1
 pytesseract>=0.3.10
