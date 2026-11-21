@@ -1,6 +1,7 @@
-# Optional dependencies for enhanced neural OCR, OpenCV curve contour fitting, and Streamlit UI.
-# Note: The project also runs out-of-the-box with zero external dependencies using
-# macOS Apple Vision Framework + Pure-Python PNG/Curve analysis + Built-in KaTeX HTTP Server!
+# Dependências opcionais para OCR neural (EasyOCR), Tesseract, OpenCV e interface Streamlit.
+# Observação: O aplicativo também funciona perfeitamente SEM instalar nenhuma dependência externa,
+# usando o OCR nativo do sistema (macOS Apple Vision / Windows WinRT OCR), leitor PNG em Python puro
+# e servidor web local integrado com KaTeX!
 
 streamlit>=1.32.0
 easyocr>=1.7.1
