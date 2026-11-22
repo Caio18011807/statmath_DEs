@@ -28,6 +28,12 @@ if [ -z "$PY_BIN" ]; then
   exit 1
 fi
 
+# Garante o motor de OCR neural multiplataforma (RapidOCR ONNX) na 1a execucao
+if ! "$PY_BIN" -c "import rapidocr_onnxruntime" >/dev/null 2>&1; then
+  echo "Preparando motor de OCR neural multiplataforma (apenas na 1a execucao)..."
+  "$PY_BIN" -m pip install --user --quiet --disable-pip-version-check rapidocr-onnxruntime >/dev/null 2>&1 || true
+fi
+
 ENTRY="$DIR/stat_vision_completo_ai_studio.py"
 if [ ! -f "$ENTRY" ]; then
   ENTRY="$DIR/app.py"

@@ -2441,12 +2441,16 @@ class OfflineOCREngine:
 
     @classmethod
     def _run_rapidocr(cls, image_path: str) -> Optional[str]:
-        """Executa RapidOCR (PP-OCRv4 ONNX multiplataforma, leve e rápido em CPU) se instalado."""
+        """
+        Executa RapidOCR (PP-OCRv4 ONNX multiplataforma, leve e determinístico em CPU).
+        Garante o MESMO resultado em Windows, macOS e Linux, reconstruindo linhas de leitura
+        da esquerda para a direita a partir das caixas delimitadoras e normalizando pontuação full-width.
+        """
         if not cls._rapidocr_checked:
             cls._rapidocr_checked = True
             try:
                 from rapidocr_onnxruntime import RapidOCR  # type: ignore
-                cls._rapidocr_engine = RapidOCR()
+                cls._rapidocr_engine = RapidOCR(box_thresh=0.3, text_score=0.3, unclip_ratio=1.8)
             except Exception:
                 cls._rapidocr_engine = None
         if cls._rapidocr_engine is None:
@@ -2455,8 +2459,46 @@ class OfflineOCREngine:
             result, _ = cls._rapidocr_engine(image_path)
             if not result:
                 return None
-            # Ordena caixas de texto de cima para baixo e da esquerda para a direita
-            lines = [str(item[1]).strip() for item in result if len(item) >= 2 and str(item[1]).strip()]
+
+            def _to_ascii_punct(s: str) -> str:
+                return "".join(chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c for c in s)
+
+            boxes: List[Tuple[float, float, float, str]] = []
+            for entry in result:
+                if len(entry) < 2:
+                    continue
+                box, raw_txt = entry[0], _to_ascii_punct(str(entry[1]).strip())
+                if not raw_txt:
+                    continue
+                xs = [float(pt[0]) for pt in box]
+                ys = [float(pt[1]) for pt in box]
+                yc = 0.5 * (min(ys) + max(ys))
+                x1 = min(xs)
+                h = max(1.0, max(ys) - min(ys))
+                boxes.append((yc, x1, h, raw_txt))
+
+            if not boxes:
+                return None
+
+            hs = sorted(b[2] for b in boxes)
+            med_h = hs[len(hs) // 2]
+            rows: List[List[Tuple[float, float, float, str]]] = []
+            for b in sorted(boxes, key=lambda t: (t[0], t[1])):
+                placed = False
+                for row in rows:
+                    row_yc = sum(r[0] for r in row) / len(row)
+                    if abs(b[0] - row_yc) <= max(med_h * 0.75, 18.0):
+                        row.append(b)
+                        placed = True
+                        break
+                if not placed:
+                    rows.append([b])
+
+            rows.sort(key=lambda row: sum(r[0] for r in row) / len(row))
+            lines: List[str] = []
+            for row in rows:
+                row.sort(key=lambda r: r[1])
+                lines.append(" ".join(r[3] for r in row))
             return "\n".join(lines) if lines else None
         except Exception:
             return None
@@ -2484,7 +2526,21 @@ class OfflineOCREngine:
 
         sidecar_text = self._read_png_text_chunks(image_path)
 
-        # 1. No macOS, prioriza o Apple Vision Framework nativo (excelente para escrita cursiva manuscrita)
+        # 1. Motor unificado multiplataforma (RapidOCR ONNX — garante o MESMO resultado em Windows, macOS e Linux!)
+        rapid_txt = self._run_rapidocr(image_path)
+        if rapid_txt:
+            if sidecar_text and sidecar_text not in rapid_txt:
+                rapid_txt = rapid_txt + "\n" + sidecar_text
+            return rapid_txt, "RapidOCR (Rede Neural ONNX Multiplataforma)"
+
+        # 2. Fallback: EasyOCR se instalado (instância em cache)
+        easy_txt = self._run_easyocr(image_path)
+        if easy_txt:
+            if sidecar_text and sidecar_text not in easy_txt:
+                easy_txt = easy_txt + "\n" + sidecar_text
+            return easy_txt, "EasyOCR (Rede Neural Local para Manuscritos)"
+
+        # 3. Fallback nativo do macOS (Apple Vision Framework)
         if sys.platform == "darwin" and shutil.which("swift"):
             try:
                 text = self._run_macos_vision_ocr(image_path)
@@ -2495,21 +2551,7 @@ class OfflineOCREngine:
             except Exception:
                 pass
 
-        # 2. Tenta RapidOCR (ONNX multiplataforma — mesmo desempenho em Windows, Linux e macOS!)
-        rapid_txt = self._run_rapidocr(image_path)
-        if rapid_txt:
-            if sidecar_text and sidecar_text not in rapid_txt:
-                rapid_txt = rapid_txt + "\n" + sidecar_text
-            return rapid_txt, "RapidOCR (Rede Neural ONNX Multiplataforma)"
-
-        # 3. Tenta EasyOCR se instalado (instância em cache)
-        easy_txt = self._run_easyocr(image_path)
-        if easy_txt:
-            if sidecar_text and sidecar_text not in easy_txt:
-                easy_txt = easy_txt + "\n" + sidecar_text
-            return easy_txt, "EasyOCR (Rede Neural Local para Manuscritos)"
-
-        # 4. Tenta Windows.Media.Ocr nativo do Windows 10/11 via PowerShell (zero dependências externas)
+        # 4. Fallback nativo do Windows 10/11 (Windows.Media.Ocr via PowerShell)
         if sys.platform == "win32" and shutil.which("powershell"):
             try:
                 text = self._run_windows_native_ocr(image_path)
@@ -3109,7 +3151,8 @@ class OfflineOCREngine:
         """
         if not raw_text:
             return ""
-        t = raw_text
+        # Converte pontuação full-width Unicode (ex.: '（', '）', '，', '；') para ASCII padrão
+        t = "".join(chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c for c in raw_text)
         t = t.replace("∼", "~").replace("≈", "~").replace("˜", "~")
         t = re.sub(r"\b[1lI]\.[1lI]\.d\.?\b", "i.i.d.", t, flags=re.IGNORECASE)
         t = re.sub(r"\biid\b", "i.i.d.", t, flags=re.IGNORECASE)
@@ -3228,9 +3271,16 @@ class OfflineOCREngine:
             t,
         )
 
-        # 2g. Normaliza Qui-Quadrado manuscrito quebrado em linhas pelo OCR (ex.: "R_1, R_2\n+ 2\n10" ou "R_1, R_2\nX 2\n10" -> "R_1, R_2 ~ Qui-Quadrado(10)")
+        # 2g. Normaliza Qui-Quadrado manuscrito quebrado em linhas ou lido horizontalmente pelo OCR
+        # Ex.: "R_1, R_2\nX 2\n10" -> "R_1, R_2 ~ Qui-Quadrado(10)"
+        # Ex.: "Q X 7 2" (onde o OCR leu Q ~ \chi^2_7 na ordem horizontal) -> "Q ~ Qui-Quadrado(7)"
         t = re.sub(
             r"(\b[A-Z]_\d(?:\s*,\s*[A-Z]_\d)*|\b[A-Z]\b)\s*(?:~|\\sim)?\s*(?:i\.?i\.?d\.?)?\s*[\r\n]+\s*(?:[+xXχ]|\\chi)\s*\^?\s*2\s*[\r\n\s]+(\d+(?:[\.,]\d+)?)\b",
+            r"\1 ~ Qui-Quadrado(\2)",
+            t,
+        )
+        t = re.sub(
+            r"(\b[A-Z]\b)\s+(?:~|\\sim)?\s*[xXχ]\s+(\d{1,3})\s+2\b",
             r"\1 ~ Qui-Quadrado(\2)",
             t,
         )
@@ -3474,7 +3524,7 @@ class OfflineOCREngine:
             "geometric": "Geometrica",
             "cauchy": "Cauchy",
         }
-        fuzzy_candidates = re.findall(r"\b([A-Za-zÀ-ÿ]{5,20})\s*[\(\[]", target_clean)
+        fuzzy_candidates = re.findall(r"\b([A-Za-zÀ-ÿ]{5,20})(?=\s*[\(\[\d\-])", target_clean)
         if fuzzy_candidates:
             # Pré-monta tabela de apelidos canônicos (tamanho >= 5) por distribuição
             alias_bank: List[Tuple[str, str]] = []
@@ -3500,7 +3550,7 @@ class OfflineOCREngine:
                 if ranked_fuzzy:
                     best_d, best_r = ranked_fuzzy[0]
                     second_r = ranked_fuzzy[1][1] if len(ranked_fuzzy) > 1 else 0.0
-                    if best_r >= 0.72 and (best_r - second_r) >= 0.06:
+                    if best_r >= 0.65 and (best_r - second_r) >= 0.08:
                         scores[best_d] += 80.0
                         matched_cues[best_d].append(
                             f"Correspondência léxica aproximada (OCR manuscrito): '{raw_word}' ≈ {best_d} ({best_r:.0%})"
@@ -3508,7 +3558,7 @@ class OfflineOCREngine:
                         canon_name = fuzzy_canonical_names.get(best_d)
                         if canon_name and _strip_acc(raw_word) != _strip_acc(canon_name):
                             cleaned_text = re.sub(
-                                r"\b" + re.escape(raw_word) + r"(?=\s*[\(\[])",
+                                r"\b" + re.escape(raw_word) + r"(?=\s*[\(\[\d\-])",
                                 canon_name,
                                 cleaned_text,
                             )
@@ -3593,14 +3643,20 @@ class OfflineOCREngine:
             scores["geometric"] += 105.0
             matched_cues["geometric"].append("Estrutura algébrica da FMP Geométrica: p(1-p)^{k-1}")
 
-        # Exponencial: \lambda e^{-\lambda x} (com ou sem '^' quando o OCR omite sobrescrito) sem \Gamma, sem fatorial e sem potência quadrática
+        # Exponencial: \lambda e^{-\lambda x} (com ou sem '^' e com espaço opcional quando o OCR separa 'e -19k')
         if (
             "gamma(" not in normalized
             and "!" not in normalized
             and "^2" not in normalized
-            and re.search(
-                r"(?:=|\|)\s*\(?(\d+\s*/\s*\d+|\d*[\.,]?\d+|\\?lambda|λ)\)?\s*(?:\\?exp|e\^?)\s*[\(\{]?\s*-\s*(?:\d+\s*/\s*\d+|\d*[\.,]?\d+|\\?lambda|λ)?\s*[a-z]",
-                normalized,
+            and (
+                re.search(
+                    r"(?:=|\|)\s*\(?(\d+\s*/\s*\d+|\d*[\.,]?\d+|\\?lambda|λ)\)?\s*(?:\\?exp|e\s*\^?)\s*[\(\{]?\s*-\s*(?:\d+\s*/\s*\d+|\d*[\.,]?\d+|\\?lambda|λ)?\s*[a-z]",
+                    normalized,
+                )
+                or re.search(
+                    r"\b(\d+(?:[\.,]\d+)?)\s+e\s*-\s*\d+(?:[\.,]\d+)?\s*[a-z]\b",
+                    normalized,
+                )
             )
         ):
             scores["exponential"] += 95.0
@@ -3913,8 +3969,8 @@ class OfflineOCREngine:
 
         m_weib = re.search(r"\bweibull\s*[\(\[]\s*(\d*[\.,]?\d+)\s*[,;]\s*(\d*[\.,]?\d+)\s*[\)\]]", text, re.IGNORECASE)
         if m_weib:
-            ctx.extracted_parameters.setdefault("lam", self._parse_numeric_or_fraction(m_weib.group(1)))
-            ctx.extracted_parameters.setdefault("k", self._parse_numeric_or_fraction(m_weib.group(2)))
+            ctx.extracted_parameters.setdefault("k", self._parse_numeric_or_fraction(m_weib.group(1)))
+            ctx.extracted_parameters.setdefault("lam", self._parse_numeric_or_fraction(m_weib.group(2)))
 
         m_lnorm = re.search(r"\b(?:lognormal|log-?normal|lnorm)\s*[\(\[]\s*([-+]?\d*[\.,]?\d+)\s*[,;]\s*(\d*[\.,]?\d+)\s*[\)\]]", text, re.IGNORECASE)
         if m_lnorm:
@@ -3954,6 +4010,56 @@ class OfflineOCREngine:
 
         # 7. Extrair parâmetros diretamente da expressão da Função Densidade/Massa (FDP/FMP) escrita na imagem!
         self._extract_parameters_from_pdf_formula(text, top_spec, ctx)
+
+        # 7b. Fallback geral para OCR que omitiu parêntese de abertura ou fechamento
+        # (ex.: "Uniforme 0 100)", "Geometrica 0,7)", "Binomial(50,0 0,1", "Lognormal 0,1 10)", "19 e -19k")
+        if top_spec.id == "uniform" and ("a" not in ctx.extracted_parameters or "b" not in ctx.extracted_parameters):
+            m_u_loose = re.search(
+                r"\b(?:Uniforme?|Unif)\s*[\(\[]?\s*([-+]?\d+(?:[\.,]\d+)?)\s*[,;\s]+\s*([-+]?\d+(?:[\.,]\d+)?)",
+                text,
+                re.IGNORECASE,
+            )
+            if m_u_loose:
+                ctx.extracted_parameters.setdefault("a", self._parse_numeric_or_fraction(m_u_loose.group(1)))
+                ctx.extracted_parameters.setdefault("b", self._parse_numeric_or_fraction(m_u_loose.group(2)))
+
+        elif top_spec.id == "geometric" and "p" not in ctx.extracted_parameters:
+            m_g_loose = re.search(
+                r"\b(?:Geometrica|Geométrica|Geometric|Geom)\s*[\(\[]?\s*(0[\.,]\d+|1\s*/\s*\d+)",
+                text,
+                re.IGNORECASE,
+            )
+            if m_g_loose:
+                ctx.extracted_parameters.setdefault("p", self._parse_numeric_or_fraction(m_g_loose.group(1)))
+
+        elif top_spec.id == "binomial" and ("n" not in ctx.extracted_parameters or "p" not in ctx.extracted_parameters):
+            m_b_loose = re.search(
+                r"\b(?:Binomial|Binom|Bin)\s*[\(\[]?\s*(\d+)\b[^\n]{0,18}?\b(0[\.,]\d+)",
+                text,
+                re.IGNORECASE,
+            )
+            if m_b_loose:
+                ctx.extracted_parameters.setdefault("n", float(m_b_loose.group(1)))
+                ctx.extracted_parameters.setdefault("p", self._parse_numeric_or_fraction(m_b_loose.group(2)))
+
+        elif top_spec.id == "lognormal" and ("mu" not in ctx.extracted_parameters or "sigma" not in ctx.extracted_parameters):
+            m_l_loose = re.search(
+                r"\b(?:Lognormal|Log-?Normal)\s*[\(\[]?\s*([-+]?\d+)(?:[\.,]\d+)?\s*[,;\s]+\s*(\d+(?:[\.,]\d+)?)",
+                text,
+                re.IGNORECASE,
+            )
+            if m_l_loose:
+                ctx.extracted_parameters.setdefault("mu", self._parse_numeric_or_fraction(m_l_loose.group(1)))
+                ctx.extracted_parameters.setdefault("sigma", self._parse_numeric_or_fraction(m_l_loose.group(2)))
+
+        elif top_spec.id == "exponential" and "lam" not in ctx.extracted_parameters:
+            m_e_loose = re.search(
+                r"\b(\d+(?:[\.,]\d+)?)\s+e\s*-\s*\d+(?:[\.,]\d+)?\s*[a-z]\b",
+                text,
+                re.IGNORECASE,
+            )
+            if m_e_loose:
+                ctx.extracted_parameters.setdefault("lam", self._parse_numeric_or_fraction(m_e_loose.group(1)))
 
         # Filtra apenas as chaves de parâmetros que pertencem à distribuição identificada
         valid_keys_by_dist = {
@@ -9315,11 +9421,13 @@ function renderRealAccuracyModalBody(data) {{
   let summaryHtml = '';
   if (acc !== null && acc !== undefined) {{
     const accColor = acc >= 80 ? '#34d399' : (acc >= 50 ? '#fbbf24' : '#fb7185');
+    const firstBackend = (items.find(x => x.backend) || {{}}).backend || 'OCR Multiplataforma';
     summaryHtml =
       '<div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;background:#090d16;border:1px solid #1e293b;border-radius:14px;padding:14px 18px;margin-bottom:14px;">' +
       '<div><div style="font-size:0.75rem;color:#94a3b8;text-transform:uppercase;font-weight:700;">Acurácia Real da IA — sᵢ = (dᵢ + pᵢ) / 2</div>' +
       '<div style="font-size:1.75rem;font-weight:900;color:' + accColor + ';">' + Number(acc).toFixed(1) + '% <span style="font-size:0.95rem;color:#cbd5e1;font-weight:600;">(' + pts + ' / ' + total + ' pts)</span></div>' +
-      '<div style="font-size:0.78rem;color:#94a3b8;margin-top:4px;">✅ 1.0 pt: <strong>' + fullHits + '</strong> &nbsp;•&nbsp; ⚠️ 0.5 pt: <strong>' + partialHits + '</strong> &nbsp;•&nbsp; ❌ 0.0 pt: <strong>' + misses + '</strong></div></div>' +
+      '<div style="font-size:0.78rem;color:#94a3b8;margin-top:4px;">✅ 1.0 pt: <strong>' + fullHits + '</strong> &nbsp;•&nbsp; ⚠️ 0.5 pt: <strong>' + partialHits + '</strong> &nbsp;•&nbsp; ❌ 0.0 pt: <strong>' + misses + '</strong></div>' +
+      '<div style="font-size:0.73rem;color:#38bdf8;margin-top:4px;">🧠 Motor OCR ativo: <strong>' + escapeHtmlBasic(firstBackend) + '</strong></div></div>' +
       '<div style="font-size:0.78rem;color:#94a3b8;text-align:right;">Última avaliação:<br/><strong style="color:#e2e8f0;">' + escapeHtmlBasic(data.evaluated_at || 'Agora') + '</strong></div>' +
       '</div>';
   }} else {{

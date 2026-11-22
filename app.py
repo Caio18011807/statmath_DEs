@@ -2398,11 +2398,13 @@ function renderRealAccuracyModalBody(data) {{
   let summaryHtml = '';
   if (acc !== null && acc !== undefined) {{
     const accColor = acc >= 80 ? '#34d399' : (acc >= 50 ? '#fbbf24' : '#fb7185');
+    const firstBackend = (items.find(x => x.backend) || {{}}).backend || 'OCR Multiplataforma';
     summaryHtml =
       '<div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;background:#090d16;border:1px solid #1e293b;border-radius:14px;padding:14px 18px;margin-bottom:14px;">' +
       '<div><div style="font-size:0.75rem;color:#94a3b8;text-transform:uppercase;font-weight:700;">Acurácia Real da IA — sᵢ = (dᵢ + pᵢ) / 2</div>' +
       '<div style="font-size:1.75rem;font-weight:900;color:' + accColor + ';">' + Number(acc).toFixed(1) + '% <span style="font-size:0.95rem;color:#cbd5e1;font-weight:600;">(' + pts + ' / ' + total + ' pts)</span></div>' +
-      '<div style="font-size:0.78rem;color:#94a3b8;margin-top:4px;">✅ 1.0 pt: <strong>' + fullHits + '</strong> &nbsp;•&nbsp; ⚠️ 0.5 pt: <strong>' + partialHits + '</strong> &nbsp;•&nbsp; ❌ 0.0 pt: <strong>' + misses + '</strong></div></div>' +
+      '<div style="font-size:0.78rem;color:#94a3b8;margin-top:4px;">✅ 1.0 pt: <strong>' + fullHits + '</strong> &nbsp;•&nbsp; ⚠️ 0.5 pt: <strong>' + partialHits + '</strong> &nbsp;•&nbsp; ❌ 0.0 pt: <strong>' + misses + '</strong></div>' +
+      '<div style="font-size:0.73rem;color:#38bdf8;margin-top:4px;">🧠 Motor OCR ativo: <strong>' + escapeHtmlBasic(firstBackend) + '</strong></div></div>' +
       '<div style="font-size:0.78rem;color:#94a3b8;text-align:right;">Última avaliação:<br/><strong style="color:#e2e8f0;">' + escapeHtmlBasic(data.evaluated_at || 'Agora') + '</strong></div>' +
       '</div>';
   }} else {{
