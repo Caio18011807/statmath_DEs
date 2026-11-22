@@ -49,7 +49,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unicodedata
 from typing import Dict, List, Optional, Tuple, Callable, Any
@@ -3153,6 +3152,8 @@ class OfflineOCREngine:
             return ""
         # Converte pontuação full-width Unicode (ex.: '（', '）', '，', '；') para ASCII padrão
         t = "".join(chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c for c in raw_text)
+        # Corrige caractere CJK '了' (U+4E86) frequentemente lido pelo RapidOCR/PaddleOCR no lugar do dígito cursivo '3'
+        t = t.replace("了", "3")
         t = t.replace("∼", "~").replace("≈", "~").replace("˜", "~")
         t = re.sub(r"\b[1lI]\.[1lI]\.d\.?\b", "i.i.d.", t, flags=re.IGNORECASE)
         t = re.sub(r"\biid\b", "i.i.d.", t, flags=re.IGNORECASE)
@@ -3601,13 +3602,20 @@ class OfflineOCREngine:
             matched_cues["chi_square"].append("Estrutura algébrica da FDP Qui-Quadrado: (1/2)^{k/2}/Γ(k/2) x^{k/2-1} e^{-x/2}")
 
         # Gama: \Gamma(\alpha) no denominador + e^{-\beta x} (sem (1/2)^ e sem \sqrt{\pi})
+        # ou estrutura da densidade '= β ... (α-1) ... -βx' quando o OCR omite Γ e e^
         if (
             "gamma(" in normalized
             and re.search(r"e\s*\^\s*\{?\s*-\s*[\d\.,a-z\\]*\s*[a-z]\b", normalized)
             and "(1/2)^" not in normalized
             and "pi" not in normalized
             and "π" not in normalized
-        ) or re.search(r"\(?(\d*[\.,]?\d+)\)?\s*\^\s*(\d+)\s+[a-z](?:\^\d+)?\s+e\s*\^\s*\{?\s*-\s*\1", normalized):
+        ) or re.search(
+            r"\(?(\d*[\.,]?\d+)\)?\s*\^\s*(\d+)\s+[a-z](?:\^\d+)?\s+e\s*\^\s*\{?\s*-\s*\1",
+            normalized,
+        ) or re.search(
+            r"=\s*(\d+(?:[\.,]\d+)?)\s*[\+\^x\*]?\s*(\d+(?:[\.,]\d+)?)\s*-\s*1\b[^=\n]*-\s*\1\s*[a-z]\b",
+            normalized,
+        ):
             scores["gamma"] += 105.0
             matched_cues["gamma"].append("Estrutura algébrica da FDP Gama: (β^α / Γ(α)) x^{α-1} e^{-βx}")
 
@@ -4187,6 +4195,15 @@ class OfflineOCREngine:
                 m_ba = re.search(r"\(?(\d*[\.,]?\d+)\)?\s*\^\s*\{?(\d*[\.,]?\d+)\}?\s+[a-z]", text, re.IGNORECASE)
                 if m_ba:
                     p.setdefault("alpha", cls._parse_numeric_or_fraction(m_ba.group(2)))
+            if "alpha" not in p or "beta" not in p:
+                m_gam_struct = re.search(
+                    r"=\s*(\d+(?:[\.,]\d+)?)\s*[\+\^x\*]?\s*(\d+(?:[\.,]\d+)?)\s*-\s*1\b[^=\n]*-\s*\1\s*[a-z]\b",
+                    text,
+                    re.IGNORECASE,
+                )
+                if m_gam_struct:
+                    p.setdefault("beta", cls._parse_numeric_or_fraction(m_gam_struct.group(1)))
+                    p.setdefault("alpha", cls._parse_numeric_or_fraction(m_gam_struct.group(2)))
             if "\\psi" in text or "\\eta" in text:
                 ctx.symbolic_parameters_detected = [r"\psi", r"\eta"]
             elif not p:
