@@ -15,6 +15,8 @@ completo e didático em Português Brasileiro:
 """
 
 from dataclasses import dataclass
+import hashlib
+import math
 import os
 from typing import Dict, List, Optional, Tuple, Any
 from stat_vision.knowledge_base import DistributionSpec, DISTRIBUTIONS_DB
@@ -46,9 +48,45 @@ class StatisticalImageAnalyzer:
     e devolve um relatório educacional completo.
     """
 
+    _ANALYSIS_CACHE: Dict[str, DistributionReport] = {}
+    _ANALYSIS_CACHE_ORDER: List[str] = []
+    _ANALYSIS_CACHE_MAX: int = 64
+
     def __init__(self):
         self.ocr_engine = OfflineOCREngine()
         self.curve_analyzer = CurveShapeAnalyzer()
+
+    @staticmethod
+    def _compute_cache_key(image_path: Optional[str], extra_text_hint: str) -> Optional[str]:
+        hint_norm = (extra_text_hint or "").strip()
+        if image_path and os.path.exists(image_path):
+            try:
+                with open(image_path, "rb") as f:
+                    digest = hashlib.sha256(f.read()).hexdigest()
+                return f"img:{digest}|hint:{hint_norm}"
+            except OSError:
+                return None
+        if hint_norm:
+            return f"txt:{hashlib.sha256(hint_norm.encode('utf-8')).hexdigest()}"
+        return None
+
+    @staticmethod
+    def _softmax_posterior_confidence(combined_scores: Dict[str, float], top_id: str, temperature: float = 45.0) -> float:
+        """
+        Calibração probabilística via Softmax com temperatura T sobre as 13 classes:
+            P(C_k | x) = exp(s_k / T) / sum_j exp(s_j / T)
+        Retorna a probabilidade a posteriori calibrada da classe vencedora em [0.08, 0.99].
+        """
+        vals = list(combined_scores.values())
+        if not vals:
+            return 0.50
+        max_v = max(vals)
+        if max_v <= 0.0:
+            return round(1.0 / max(len(vals), 1), 4)
+        exps = {k: math.exp((v - max_v) / max(temperature, 1.0)) for k, v in combined_scores.items()}
+        denom = sum(exps.values()) or 1.0
+        post = exps.get(top_id, 0.0) / denom
+        return round(min(0.99, max(0.08, post)), 4)
 
     @staticmethod
     def _ocr_richness_score(res: OCRAnalysisResult) -> float:
@@ -67,6 +105,10 @@ class StatisticalImageAnalyzer:
         return top_s + bonus
 
     def analyze(self, image_path: Optional[str] = None, extra_text_hint: str = "") -> DistributionReport:
+        cache_key = self._compute_cache_key(image_path, extra_text_hint)
+        if cache_key and cache_key in self._ANALYSIS_CACHE:
+            return self._ANALYSIS_CACHE[cache_key]
+
         # ESTÁGIO 1 (PRIORIDADE): Sempre analisa primeiro a imagem padrão original
         ocr_res = self.ocr_engine.analyze_image_text(image_path, extra_text_hint=extra_text_hint)
         if image_path and os.path.exists(image_path):
@@ -144,10 +186,7 @@ class StatisticalImageAnalyzer:
             ocr_res.cleaned_handwriting_text, top_spec
         )
 
-        top_score = combined_scores[top_id]
-        second_score = combined_scores[ranked_ids[1]] if len(ranked_ids) > 1 else 0.0
-        margin = max(0.0, top_score - second_score)
-        confidence = min(0.99, max(0.50, 0.60 + (top_score / 200.0) * 0.20 + (margin / 100.0) * 0.20))
+        confidence = self._softmax_posterior_confidence(combined_scores, top_id, temperature=45.0)
 
         reasoning: List[str] = []
         if ocr_res.matched_cues.get(top_id):
@@ -174,7 +213,7 @@ class StatisticalImageAnalyzer:
             for d_id in ranked_ids[:5]
         ]
 
-        return DistributionReport(
+        report = DistributionReport(
             image_path=image_path or "",
             identified_distribution=top_spec,
             confidence=round(confidence, 4),
@@ -184,6 +223,15 @@ class StatisticalImageAnalyzer:
             numeric_summary=numeric_summary,
             identification_reasoning=reasoning,
         )
+        if cache_key:
+            self._ANALYSIS_CACHE[cache_key] = report
+            if cache_key in self._ANALYSIS_CACHE_ORDER:
+                self._ANALYSIS_CACHE_ORDER.remove(cache_key)
+            self._ANALYSIS_CACHE_ORDER.append(cache_key)
+            if len(self._ANALYSIS_CACHE_ORDER) > self._ANALYSIS_CACHE_MAX:
+                oldest = self._ANALYSIS_CACHE_ORDER.pop(0)
+                self._ANALYSIS_CACHE.pop(oldest, None)
+        return report
 
     def format_markdown_report(self, report: DistributionReport) -> str:
         spec = report.identified_distribution

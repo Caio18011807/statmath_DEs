@@ -938,6 +938,90 @@ if let img = NSImage(pasteboard: pb),
             self.wfile.write(payload)
             return
 
+        if parsed.path == "/api/analyze":
+            import time as _time
+            t0 = _time.perf_counter()
+            try:
+                content_len = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(content_len).decode("utf-8", errors="ignore")
+                params = urllib.parse.parse_qs(body)
+                hint = params.get("hint", [""])[0].strip()
+                data_url = params.get("image_data_url", [""])[0].strip()
+                orig_data_url = params.get("original_image_data_url", [""])[0].strip()
+                action = params.get("action", ["analyze"])[0]
+
+                if action == "clear":
+                    out_html = self._build_results_column_html(None)
+                    resp_obj = {"ok": True, "html": out_html, "dist_id": "", "dist_name": "", "elapsed_ms": 0, "image_data_url": ""}
+                else:
+                    if action == "paste_system_clipboard":
+                        clip_b64 = self._read_macos_system_clipboard_image_b64()
+                        if clip_b64:
+                            data_url = f"data:image/png;base64,{clip_b64}"
+                            orig_data_url = data_url
+
+                    if not orig_data_url.startswith("data:image/"):
+                        orig_data_url = data_url
+
+                    report_ajax: Optional[DistributionReport] = None
+                    if data_url.startswith("data:image/") and "," in data_url:
+                        header_part, b64_part = data_url.split(",", 1)
+                        ext = ".jpg" if ("jpeg" in header_part or "jpg" in header_part) else (".webp" if "webp" in header_part else ".png")
+                        raw_bytes = base64.b64decode(b64_part)
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                        tmp.write(raw_bytes)
+                        tmp.close()
+                        try:
+                            report_ajax = self.analyzer.analyze(tmp.name, extra_text_hint=hint)
+                            if orig_data_url.startswith("data:image/") and "," in orig_data_url and orig_data_url != data_url:
+                                orig_header, orig_b64 = orig_data_url.split(",", 1)
+                                orig_ext = ".jpg" if ("jpeg" in orig_header or "jpg" in orig_header) else (".webp" if "webp" in orig_header else ".png")
+                                tmp_orig = tempfile.NamedTemporaryFile(delete=False, suffix=orig_ext)
+                                tmp_orig.write(base64.b64decode(orig_b64))
+                                tmp_orig.close()
+                                try:
+                                    rep_orig = self.analyzer.analyze(tmp_orig.name, extra_text_hint=hint)
+                                    c_sc = max(report_ajax.ocr_result.distribution_scores.values() or [0.0])
+                                    o_sc = max(rep_orig.ocr_result.distribution_scores.values() or [0.0])
+                                    c_p = len(report_ajax.ocr_result.statistical_context.extracted_parameters)
+                                    o_p = len(rep_orig.ocr_result.statistical_context.extracted_parameters)
+                                    if o_sc > c_sc or o_p > c_p:
+                                        report_ajax = rep_orig
+                                finally:
+                                    try:
+                                        os.remove(tmp_orig.name)
+                                    except OSError:
+                                        pass
+                        finally:
+                            try:
+                                os.remove(tmp.name)
+                            except OSError:
+                                pass
+                    elif hint:
+                        report_ajax = self.analyzer.analyze(None, extra_text_hint=hint)
+
+                    out_html = self._build_results_column_html(report_ajax)
+                    elapsed_ms = int(round((_time.perf_counter() - t0) * 1000))
+                    resp_obj = {
+                        "ok": True,
+                        "html": out_html,
+                        "dist_id": report_ajax.identified_distribution.id if report_ajax else "",
+                        "dist_name": report_ajax.identified_distribution.name if report_ajax else "",
+                        "elapsed_ms": elapsed_ms,
+                        "image_data_url": orig_data_url if orig_data_url.startswith("data:image/") else "",
+                    }
+                payload = json.dumps(resp_obj, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+            except Exception as exc:
+                payload = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
+                self.send_response(500)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         content_len = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_len).decode("utf-8", errors="ignore")
         params = urllib.parse.parse_qs(body)
@@ -1489,7 +1573,55 @@ if let img = NSImage(pasteboard: pb),
     align-items: start;
   }}
   @media (max-width: 980px) {{
-    .app-layout {{ grid-template-columns: 1fr; padding: 12px; }}
+    .app-layout {{ grid-template-columns: 1fr; padding: 12px; gap: 16px; }}
+    .app-navbar {{ padding: 10px 14px; flex-wrap: wrap; gap: 8px; }}
+  }}
+  @media (max-width: 600px) {{
+    .viewfinder {{ height: 230px !important; }}
+    .brand {{ font-size: 1.05rem; }}
+    .dock-btn {{ padding: 7px 10px; font-size: 0.80rem; }}
+  }}
+  .recent-strip {{
+    margin-top: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 10px 12px;
+    display: none;
+  }}
+  .recent-strip-items {{
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-top: 6px;
+    padding-bottom: 2px;
+  }}
+  .recent-chip {{
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    background: #090d16;
+    border: 1.5px solid #26334d;
+    border-radius: 10px;
+    padding: 4px 9px 4px 5px;
+    cursor: pointer;
+    color: #e2e8f0;
+    font-size: 0.76rem;
+    font-weight: 600;
+    transition: border-color 0.15s, transform 0.12s;
+  }}
+  .recent-chip:hover {{ border-color: #fb7185; transform: translateY(-1px); }}
+  .recent-chip.active {{ border-color: #e11d48; background: rgba(225,29,72,0.14); }}
+  .recent-chip img {{ width: 34px; height: 26px; object-fit: cover; border-radius: 6px; background: #0f172a; }}
+  @keyframes statPulse {{ 0%, 100% {{ opacity: 0.55; }} 50% {{ opacity: 1; }} }}
+  .ajax-loading-card {{
+    background: var(--card);
+    border: 1.5px solid #334155;
+    border-radius: 20px;
+    padding: 36px 24px;
+    text-align: center;
+    animation: statPulse 1.2s ease-in-out infinite;
   }}
 
   /* MÓDULO SCANNER LIMPO (Coluna Esquerda) */
@@ -1965,7 +2097,7 @@ if let img = NSImage(pasteboard: pb),
           </button>
         </div>
 
-        <form method="POST" id="analyzeForm" onsubmit="prepareFormBeforeSubmit()">
+        <form method="POST" id="analyzeForm" onsubmit="return onAnalyzeFormSubmit(event)">
           <input type="hidden" name="action" id="formAction" value="analyze"/>
           <input type="hidden" name="image_data_url" id="imageDataUrl" value="{html.escape(prev_data_url)}"/>
           <input type="hidden" name="original_image_data_url" id="originalImageDataUrl" value="{html.escape(prev_data_url)}"/>
@@ -1988,10 +2120,19 @@ if let img = NSImage(pasteboard: pb),
         </form>
       </div>
     </div>
+
+    <!-- BARRA DE TROCA RÁPIDA ENTRE IMAGENS RECENTES -->
+    <div id="recentImagesStrip" class="recent-strip">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:0.76rem;color:#94a3b8;font-weight:700;">⚡ Troca Rápida (clique para alternar instantaneamente)</span>
+        <button type="button" onclick="clearRecentStrip()" style="background:none;border:none;color:#64748b;font-size:0.72rem;cursor:pointer;">Limpar histórico</button>
+      </div>
+      <div id="recentStripItems" class="recent-strip-items"></div>
+    </div>
   </div>
 
   <!-- COLUNA DIREITA: RESULTADO EM LATEX E SUB-REGIÕES RETRÁTEIS -->
-  <div>
+  <div id="resultsColumn">
     {results_column_html}
   </div>
 </div>
@@ -2107,10 +2248,188 @@ function prepareFormBeforeSubmit() {{
   }}
 }}
 
+let activeAnalyzeController = null;
+let recentImages = [];
+let activeRecentIdx = -1;
+
+function showInstantImagePreview(dataUrl) {{
+  const preview = document.getElementById('previewImage');
+  const placeholder = document.getElementById('emptyPlaceholder');
+  const controls = document.getElementById('zoomPanControls');
+  if (dataUrl && dataUrl.startsWith('data:image/')) {{
+    preview.src = dataUrl;
+    preview.style.display = 'block';
+    placeholder.style.display = 'none';
+    if (controls) controls.style.display = 'block';
+  }} else {{
+    preview.src = '';
+    preview.style.display = 'none';
+    placeholder.style.display = 'flex';
+    if (controls) controls.style.display = 'none';
+  }}
+}}
+
+function mountResultsColumnHtml(rawHtml) {{
+  const col = document.getElementById('resultsColumn');
+  if (!col) return;
+  col.innerHTML = rawHtml;
+  // Re-executa os scripts inline (gráfico SVG interativo)
+  col.querySelectorAll('script').forEach(oldScript => {{
+    const newScript = document.createElement('script');
+    newScript.textContent = oldScript.textContent;
+    oldScript.parentNode.replaceChild(newScript, oldScript);
+  }});
+  if (typeof renderMathInElement === 'function') {{
+    renderMathInElement(col, {{
+      delimiters: [
+        {{ left: '\\\\[', right: '\\\\]', display: true }},
+        {{ left: '\\\\(', right: '\\\\)', display: false }}
+      ],
+      throwOnError: false
+    }});
+  }}
+}}
+
+function renderRecentStrip() {{
+  const wrap = document.getElementById('recentImagesStrip');
+  const list = document.getElementById('recentStripItems');
+  if (!wrap || !list) return;
+  if (recentImages.length === 0) {{
+    wrap.style.display = 'none';
+    return;
+  }}
+  wrap.style.display = 'block';
+  list.innerHTML = '';
+  recentImages.forEach((item, idx) => {{
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'recent-chip' + (idx === activeRecentIdx ? ' active' : '');
+    btn.title = 'Clique para voltar instantaneamente para esta imagem';
+    btn.onclick = () => switchToRecentImage(idx);
+    const img = document.createElement('img');
+    img.src = item.dataUrl;
+    const lbl = document.createElement('span');
+    lbl.textContent = item.label || ('Imagem ' + (idx + 1));
+    btn.appendChild(img);
+    btn.appendChild(lbl);
+    list.appendChild(btn);
+  }});
+}}
+
+function upsertRecentImage(dataUrl, distName, cachedHtml) {{
+  if (!dataUrl || !dataUrl.startsWith('data:image/')) return;
+  const shortLbl = (distName || 'Imagem').replace(/^Distribui[çc][ãa]o\s+(de\s+)?/i, '').split('(')[0].trim().slice(0, 18) || 'Imagem';
+  const existingIdx = recentImages.findIndex(it => it.dataUrl === dataUrl);
+  if (existingIdx >= 0) {{
+    recentImages[existingIdx].label = shortLbl;
+    recentImages[existingIdx].html = cachedHtml;
+    activeRecentIdx = existingIdx;
+  }} else {{
+    recentImages.unshift({{ dataUrl, label: shortLbl, html: cachedHtml }});
+    if (recentImages.length > 8) recentImages.pop();
+    activeRecentIdx = 0;
+  }}
+  renderRecentStrip();
+}}
+
+function switchToRecentImage(idx) {{
+  const item = recentImages[idx];
+  if (!item) return;
+  stopCameraStream();
+  resetPanZoom();
+  activeRecentIdx = idx;
+  document.getElementById('originalImageDataUrl').value = item.dataUrl;
+  document.getElementById('imageDataUrl').value = item.dataUrl;
+  showInstantImagePreview(item.dataUrl);
+  renderRecentStrip();
+  if (item.html) {{
+    mountResultsColumnHtml(item.html);
+    document.getElementById('scannerStatusBadge').innerText = '⚡ Troca instantânea';
+  }} else {{
+    runAjaxAnalyze('analyze');
+  }}
+}}
+
+function clearRecentStrip() {{
+  recentImages = [];
+  activeRecentIdx = -1;
+  renderRecentStrip();
+}}
+
+async function runAjaxAnalyze(actionName) {{
+  const statusEl = document.getElementById('scannerStatusBadge');
+  const col = document.getElementById('resultsColumn');
+  if (activeAnalyzeController) {{
+    try {{ activeAnalyzeController.abort(); }} catch (e) {{}}
+  }}
+  activeAnalyzeController = new AbortController();
+
+  document.getElementById('formAction').value = actionName || 'analyze';
+  if (actionName !== 'clear' && actionName !== 'paste_system_clipboard') {{
+    prepareFormBeforeSubmit();
+  }}
+
+  if (statusEl) statusEl.innerText = actionName === 'clear' ? 'Limpando...' : '⚡ Analisando...';
+  if (col && actionName !== 'clear') {{
+    col.innerHTML =
+      '<div class="ajax-loading-card">' +
+      '<div style="font-size:2rem;margin-bottom:8px;">⚡</div>' +
+      '<div style="font-weight:800;font-size:1.05rem;color:#fff;margin-bottom:6px;">Analisando distribuição...</div>' +
+      '<div style="font-size:0.84rem;color:#94a3b8;">Você já pode trocar ou colar outra imagem a qualquer momento sem esperar.</div>' +
+      '</div>';
+  }}
+
+  const bodyParams = new URLSearchParams();
+  bodyParams.set('action', document.getElementById('formAction').value);
+  bodyParams.set('hint', document.getElementById('hintInput').value || '');
+  bodyParams.set('image_data_url', document.getElementById('imageDataUrl').value || '');
+  bodyParams.set('original_image_data_url', document.getElementById('originalImageDataUrl').value || '');
+  bodyParams.set('pan_x', document.getElementById('panXInput').value || '0');
+  bodyParams.set('pan_y', document.getElementById('panYInput').value || '0');
+  bodyParams.set('zoom_scale', document.getElementById('zoomScaleInput').value || '1');
+
+  try {{
+    const resp = await fetch('/api/analyze', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }},
+      body: bodyParams.toString(),
+      signal: activeAnalyzeController.signal,
+    }});
+    const data = await resp.json();
+    if (!data || !data.ok) {{
+      if (statusEl) statusEl.innerText = 'Erro na análise';
+      return;
+    }}
+    if (actionName === 'paste_system_clipboard' && data.image_data_url) {{
+      resetPanZoom();
+      document.getElementById('originalImageDataUrl').value = data.image_data_url;
+      document.getElementById('imageDataUrl').value = data.image_data_url;
+      showInstantImagePreview(data.image_data_url);
+    }}
+    mountResultsColumnHtml(data.html || '');
+    if (actionName !== 'clear') {{
+      const imgUrl = data.image_data_url || document.getElementById('originalImageDataUrl').value;
+      if (imgUrl && imgUrl.startsWith('data:image/')) {{
+        upsertRecentImage(imgUrl, data.dist_name, data.html || '');
+      }}
+      if (statusEl) statusEl.innerText = '✅ ' + (data.elapsed_ms || 0) + ' ms';
+    }} else {{
+      if (statusEl) statusEl.innerText = 'Pronto';
+    }}
+  }} catch (err) {{
+    if (err && err.name === 'AbortError') return;
+    if (statusEl) statusEl.innerText = 'Erro de conexão';
+  }}
+}}
+
+function onAnalyzeFormSubmit(ev) {{
+  if (ev) ev.preventDefault();
+  runAjaxAnalyze('analyze');
+  return false;
+}}
+
 function applyPanZoomAndAnalyze() {{
-  document.getElementById('formAction').value = 'analyze';
-  prepareFormBeforeSubmit();
-  document.getElementById('analyzeForm').submit();
+  runAjaxAnalyze('analyze');
 }}
 
 function handleShutterClick() {{
@@ -2180,19 +2499,23 @@ function captureAndCropFromScanner() {{
   resetPanZoom();
   document.getElementById('originalImageDataUrl').value = dataUrl;
   document.getElementById('imageDataUrl').value = dataUrl;
-  document.getElementById('formAction').value = 'analyze';
-  document.getElementById('analyzeForm').submit();
+  showInstantImagePreview(dataUrl);
+  runAjaxAnalyze('analyze');
 }}
 
 function handleSelectedImageFile(file) {{
   if (!file) return;
   const reader = new FileReader();
   reader.onload = function(evt) {{
+    const dataUrl = evt.target.result;
+    stopCameraStream();
     resetPanZoom();
-    document.getElementById('originalImageDataUrl').value = evt.target.result;
-    document.getElementById('imageDataUrl').value = evt.target.result;
-    document.getElementById('formAction').value = 'analyze';
-    document.getElementById('analyzeForm').submit();
+    document.getElementById('originalImageDataUrl').value = dataUrl;
+    document.getElementById('imageDataUrl').value = dataUrl;
+    showInstantImagePreview(dataUrl);
+    const fi = document.getElementById('fileInput');
+    if (fi) fi.value = '';
+    runAjaxAnalyze('analyze');
   }};
   reader.readAsDataURL(file);
 }}
@@ -2312,8 +2635,7 @@ async function pasteFromClipboard() {{
     }}
   }}
   // Fallback garantido: pede ao backend Python para ler a Área de Transferência do Sistema (NSPasteboard / ImageGrab)
-  document.getElementById('formAction').value = 'paste_system_clipboard';
-  document.getElementById('analyzeForm').submit();
+  runAjaxAnalyze('paste_system_clipboard');
 }}
 
 function clearAllInput() {{
@@ -2322,8 +2644,10 @@ function clearAllInput() {{
   document.getElementById('imageDataUrl').value = '';
   document.getElementById('originalImageDataUrl').value = '';
   document.getElementById('hintInput').value = '';
-  document.getElementById('formAction').value = 'clear';
-  document.getElementById('analyzeForm').submit();
+  showInstantImagePreview('');
+  activeRecentIdx = -1;
+  renderRecentStrip();
+  runAjaxAnalyze('clear');
 }}
 
 function toggleAllSteps(expand) {{
@@ -2562,6 +2886,16 @@ def run_standalone_server(port: int = 8501, open_browser: bool = False) -> None:
     def _background_warmup_and_eval() -> None:
         try:
             StatVisionHTTPHandler.analyzer.ocr_engine._load_learned_data()
+            # Pré-aquece a sessão ONNX do RapidOCR em segundo plano para a 1ª foto já ser rápida
+            try:
+                if not StatVisionHTTPHandler.analyzer.ocr_engine._rapidocr_checked:
+                    StatVisionHTTPHandler.analyzer.ocr_engine._rapidocr_checked = True
+                    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+                    StatVisionHTTPHandler.analyzer.ocr_engine._rapidocr_engine = RapidOCR(
+                        box_thresh=0.3, text_score=0.3, unclip_ratio=1.8
+                    )
+            except Exception:
+                pass
             cached = get_cached_real_evaluation()
             if (cached.get("image_count_in_folder") or 0) > 0 and not cached.get("is_fresh"):
                 evaluate_real_test_folder(analyzer=StatVisionHTTPHandler.analyzer, force=False)
